@@ -1,1072 +1,731 @@
-use std::{collections::HashMap, str::FromStr};
+//! fPOW CLI - Algorand Client
+//!
+//! Command-line interface for interacting with the fPOW smart contract on Algorand.
+//! Uses Nodely's free Algorand API endpoints with built-in rate limiting.
+//!
+//! ## Nodely Free Tier Limits
+//! - 200,000 requests per day (6M per month)
+//! - 1000 requests/second shared across all free tier users
+//! - 50-150ms artificial delay on responses
+//!
+//! This CLI implements conservative rate limiting to avoid hitting these limits.
 
-use entropy_api::prelude::*;
-use jup_swap::{
-    quote::QuoteRequest,
-    swap::SwapRequest,
-    transaction_config::{DynamicSlippageSettings, TransactionConfig},
-    JupiterSwapApiClient,
+use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use algonaut::algod::v2::Algod;
+use algonaut::core::{Address, MicroAlgos};
+use algonaut::transaction::{
+    account::Account,
+    builder::CallApplication,
+    TxnBuilder,
 };
-use ore_api::prelude::*;
-use solana_account_decoder::UiAccountEncoding;
-use solana_client::{
-    client_error::{reqwest::StatusCode, ClientErrorKind},
-    nonblocking::rpc_client::RpcClient,
-    rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig},
-    rpc_filter::{Memcmp, RpcFilterType},
-};
-use solana_sdk::{
-    address_lookup_table::{state::AddressLookupTable, AddressLookupTableAccount},
-    compute_budget::ComputeBudgetInstruction,
-    message::{v0::Message, VersionedMessage},
-    native_token::{lamports_to_sol, LAMPORTS_PER_SOL},
-    pubkey::Pubkey,
-    rent::Rent,
-    signature::{read_keypair_file, Signature, Signer},
-    transaction::{Transaction, VersionedTransaction},
-};
-use solana_sdk::{keccak, pubkey};
-use spl_associated_token_account::get_associated_token_address;
-use spl_token::amount_to_ui_amount;
-use steel::{AccountDeserialize, AccountMeta, Clock, Discriminator, Instruction};
+use anyhow::Result;
+use fpow_api::prelude::*;
+use tokio::sync::Mutex;
+use tokio::time::sleep;
 
-#[tokio::main]
-async fn main() {
-    // Read keypair from file
-    let payer =
-        read_keypair_file(&std::env::var("KEYPAIR").expect("Missing KEYPAIR env var")).unwrap();
+// =============================================================================
+// Nodely Endpoints (Free Tier)
+// Documentation: https://nodely.io/docs/free/start/
+// =============================================================================
 
-    // Build transaction
-    let rpc = RpcClient::new(std::env::var("RPC").expect("Missing RPC env var"));
-    match std::env::var("COMMAND")
-        .expect("Missing COMMAND env var")
-        .as_str()
-    {
-        "automations" => {
-            log_automations(&rpc).await.unwrap();
-        }
-        "clock" => {
-            log_clock(&rpc).await.unwrap();
-        }
-        "claim" => {
-            claim(&rpc, &payer).await.unwrap();
-        }
-        "board" => {
-            log_board(&rpc).await.unwrap();
-        }
-        "config" => {
-            log_config(&rpc).await.unwrap();
-        }
-        "buyback" => {
-            buyback(&rpc, &payer).await.unwrap();
-        }
-        "reset" => {
-            reset(&rpc, &payer).await.unwrap();
-        }
-        "treasury" => {
-            log_treasury(&rpc).await.unwrap();
-        }
-        "miner" => {
-            log_miner(&rpc, &payer).await.unwrap();
-        }
-        // "pool" => {
-        //     log_meteora_pool(&rpc).await.unwrap();
-        // }
-        "deploy" => {
-            deploy(&rpc, &payer).await.unwrap();
-        }
-        "stake" => {
-            log_stake(&rpc, &payer).await.unwrap();
-        }
-        "deploy_all" => {
-            deploy_all(&rpc, &payer).await.unwrap();
-        }
-        "round" => {
-            log_round(&rpc).await.unwrap();
-        }
-        "set_admin" => {
-            set_admin(&rpc, &payer).await.unwrap();
-        }
-        "ata" => {
-            ata(&rpc, &payer).await.unwrap();
-        }
-        "checkpoint" => {
-            checkpoint(&rpc, &payer).await.unwrap();
-        }
-        "checkpoint_all" => {
-            checkpoint_all(&rpc, &payer).await.unwrap();
-        }
-        "close_all" => {
-            close_all(&rpc, &payer).await.unwrap();
-        }
-        "participating_miners" => {
-            participating_miners(&rpc).await.unwrap();
-        }
-        "new_var" => {
-            new_var(&rpc, &payer).await.unwrap();
-        }
-        "keys" => {
-            keys().await.unwrap();
-        }
-        "lut" => {
-            lut(&rpc, &payer).await.unwrap();
-        }
-        "liq" => {
-            liq(&rpc, &payer).await.unwrap();
-        }
-        "automation" => {
-            log_automation(&rpc).await.unwrap();
-        }
-        _ => panic!("Invalid command"),
-    };
+/// Nodely mainnet algod API endpoint
+pub const NODELY_MAINNET_ALGOD: &str = "https://mainnet-api.4160.nodely.dev";
+
+/// Nodely testnet algod API endpoint
+pub const NODELY_TESTNET_ALGOD: &str = "https://testnet-api.4160.nodely.dev";
+
+/// Nodely mainnet indexer API endpoint
+pub const NODELY_MAINNET_INDEXER: &str = "https://mainnet-idx.4160.nodely.dev";
+
+/// Nodely testnet indexer API endpoint
+pub const NODELY_TESTNET_INDEXER: &str = "https://testnet-idx.4160.nodely.dev";
+
+// =============================================================================
+// Rate Limiting Configuration
+// Based on Nodely free tier limits: https://nodely.io/docs/free/policy/
+// =============================================================================
+
+/// Maximum requests per second (conservative limit, actual shared limit is 1000)
+const MAX_REQUESTS_PER_SECOND: u32 = 10;
+
+/// Minimum delay between requests in milliseconds
+const MIN_REQUEST_DELAY_MS: u64 = 100; // 10 requests/sec max
+
+/// Maximum daily requests (Nodely free tier limit is 200K)
+const MAX_DAILY_REQUESTS: u64 = 180_000; // Leave 10% buffer
+
+/// Initial backoff delay for rate limit errors (429)
+const INITIAL_BACKOFF_MS: u64 = 1000;
+
+/// Maximum backoff delay
+const MAX_BACKOFF_MS: u64 = 60_000;
+
+/// Maximum retry attempts for rate-limited requests
+const MAX_RETRIES: u32 = 5;
+
+// =============================================================================
+// Rate Limiter Implementation
+// =============================================================================
+
+/// Rate limiter for Nodely API requests
+pub struct RateLimiter {
+    /// Last request timestamp
+    last_request: Mutex<Instant>,
+    /// Request count for today
+    daily_requests: AtomicU64,
+    /// Day start timestamp
+    day_start: Mutex<Instant>,
+    /// Current backoff delay (increases on rate limit errors)
+    current_backoff: AtomicU64,
 }
 
-async fn liq(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-) -> Result<(), anyhow::Error> {
-    let manager = pubkey!("DJqfQWB8tZE6fzqWa8okncDh7ciTuD8QQKp1ssNETWee");
-    let wrap_ix = ore_api::sdk::wrap(payer.pubkey(), u64::MAX);
-    let liq_ix = ore_api::sdk::liq(payer.pubkey(), manager);
-    submit_transaction(rpc, payer, &[wrap_ix, liq_ix]).await?;
-    Ok(())
-}
-
-async fn lut(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-) -> Result<(), anyhow::Error> {
-    let recent_slot = rpc.get_slot().await? - 4;
-    let (ix, lut_address) = solana_address_lookup_table_interface::instruction::create_lookup_table(
-        payer.pubkey(),
-        payer.pubkey(),
-        recent_slot,
-    );
-    let ex_ix = solana_address_lookup_table_interface::instruction::extend_lookup_table(
-        lut_address,
-        payer.pubkey(),
-        Some(payer.pubkey()),
-        vec![
-            pubkey!("HNWhK5f8RMWBqcA7mXJPaxdTPGrha3rrqUrri7HSKb3T"),
-            pubkey!("2wQ7J46uwK3VyrmAYe5E8KhCjTg8CTaFimh1ty2huuyY"),
-            pubkey!("DJqfQWB8tZE6fzqWa8okncDh7ciTuD8QQKp1ssNETWee"),
-            pubkey!("HLaJ3RiyoaxQzwJQbU2Gc5RTZtx8HKAMJgkf57qdgpFJ"),
-            pubkey!("8yS5zJTZa1Q1zQ1jsEAUnjAyMZfsNwvrgbDQp1ky2dr"),
-            pubkey!("7qBS6huLjjGyrnMMBNXpLZA73yiGc6ao9znj7f9RpF1L"),
-            pubkey!("3Mt1bpU3fnSXyPEm66HKKXyQTpLWrwYziPLqwTqK4ZT7"),
-            pubkey!("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"),
-            pubkey!("oreoU2P8bN6jkk3jbaiVxYnG1dCXcYxwhwyK9jSybcp"),
-            pubkey!("So11111111111111111111111111111111111111112"),
-            pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
-            pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"),
-            pubkey!("D1ZN9Wj1fRSUQfCjhvnu1hqDMT7hzjzBBpi12nVniYD6"),
-            pubkey!("8kqLv9cBUDCYEKCL3Dj2MkeXX3tdCqT8KZ3gpYp8BnGP"),
-            pubkey!("H38TVzkjAiAhBZR5SksbW8XDXP3N1ez4Tuna7uAW1Tsw"),
-            pubkey!("11111111111111111111111111111111"),
-            pubkey!("SysvarRent111111111111111111111111111111111"),
-        ],
-    );
-    let ix_1 = Instruction {
-        program_id: ix.program_id,
-        accounts: ix
-            .accounts
-            .iter()
-            .map(|a| AccountMeta::new(a.pubkey, a.is_signer))
-            .collect(),
-        data: ix.data,
-    };
-    let ix_2 = Instruction {
-        program_id: ex_ix.program_id,
-        accounts: ex_ix
-            .accounts
-            .iter()
-            .map(|a| AccountMeta::new(a.pubkey, a.is_signer))
-            .collect(),
-        data: ex_ix.data,
-    };
-    submit_transaction(rpc, payer, &[ix_1, ix_2]).await?;
-    println!("LUT address: {}", lut_address);
-    Ok(())
-}
-
-async fn new_var(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-) -> Result<(), anyhow::Error> {
-    let provider = std::env::var("PROVIDER").expect("Missing PROVIDER env var");
-    let provider = Pubkey::from_str(&provider).expect("Invalid PROVIDER");
-    let commit = std::env::var("COMMIT").expect("Missing COMMIT env var");
-    let commit = keccak::Hash::from_str(&commit).expect("Invalid COMMIT");
-    let samples = std::env::var("SAMPLES").expect("Missing SAMPLES env var");
-    let samples = u64::from_str(&samples).expect("Invalid SAMPLES");
-    let board_address = board_pda().0;
-    let var_address = entropy_api::state::var_pda(board_address, 0).0;
-    println!("Var address: {}", var_address);
-    let ix = ore_api::sdk::new_var(payer.pubkey(), provider, 0, commit.to_bytes(), samples);
-    submit_transaction(rpc, payer, &[ix]).await?;
-    Ok(())
-}
-
-async fn participating_miners(rpc: &RpcClient) -> Result<(), anyhow::Error> {
-    let round_id = std::env::var("ID").expect("Missing ID env var");
-    let round_id = u64::from_str(&round_id).expect("Invalid ID");
-    let miners = get_miners_participating(rpc, round_id).await?;
-    for (i, (_address, miner)) in miners.iter().enumerate() {
-        println!("{}: {}", i, miner.authority);
+impl RateLimiter {
+    pub fn new() -> Self {
+        Self {
+            last_request: Mutex::new(Instant::now() - Duration::from_secs(1)),
+            daily_requests: AtomicU64::new(0),
+            day_start: Mutex::new(Instant::now()),
+            current_backoff: AtomicU64::new(0),
+        }
     }
-    Ok(())
-}
 
-async fn log_stake(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-) -> Result<(), anyhow::Error> {
-    let authority = std::env::var("AUTHORITY").unwrap_or(payer.pubkey().to_string());
-    let authority = Pubkey::from_str(&authority).expect("Invalid AUTHORITY");
-    let treasury = get_treasury(&rpc).await?;
-    let staker_address = ore_api::state::stake_pda(authority).0;
-    let mut stake = get_stake(rpc, authority).await?;
-    stake.update_rewards(&treasury);
-    println!("Stake");
-    println!("  address: {}", staker_address);
-    println!("  authority: {}", authority);
-    println!(
-        "  balance: {} ORE",
-        amount_to_ui_amount(stake.balance, TOKEN_DECIMALS)
-    );
-    println!("  buffer_a: {}", stake.buffer_a);
-    println!("  buffer_b: {}", stake.buffer_b);
-    println!("  buffer_c: {}", stake.buffer_c);
-    println!("  buffer_d: {}", stake.buffer_d);
-    println!(
-        "  compound_fee_reserve: {} SOL",
-        lamports_to_sol(stake.compound_fee_reserve)
-    );
-    println!("  last_claim_at: {}", stake.last_claim_at);
-    println!("  last_deposit_at: {}", stake.last_deposit_at);
-    println!("  last_withdraw_at: {}", stake.last_withdraw_at);
-    println!(
-        "  rewards_factor: {}",
-        stake.rewards_factor.to_i80f48().to_string()
-    );
-    println!(
-        "  rewards: {} ORE",
-        amount_to_ui_amount(stake.rewards, TOKEN_DECIMALS)
-    );
-    println!(
-        "  lifetime_rewards: {} ORE",
-        amount_to_ui_amount(stake.lifetime_rewards, TOKEN_DECIMALS)
-    );
-    println!("  buffer_f: {}", stake.buffer_f);
-
-    Ok(())
-}
-
-async fn ata(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-) -> Result<(), anyhow::Error> {
-    let user = pubkey!("FgZFnb3bi7QexKCdXWPwWy91eocUD7JCFySHb83vLoPD");
-    let token = pubkey!("8H8rPiWW4iTFCfEkSnf7jpqeNpFfvdH9gLouAL3Fe2Zx");
-    let ata = get_associated_token_address(&user, &token);
-    let ix = spl_associated_token_account::instruction::create_associated_token_account(
-        &payer.pubkey(),
-        &user,
-        &token,
-        &spl_token::ID,
-    );
-    submit_transaction(rpc, payer, &[ix]).await?;
-    let account = rpc.get_account(&ata).await?;
-    println!("ATA: {}", ata);
-    println!("Account: {:?}", account);
-    Ok(())
-}
-
-async fn keys() -> Result<(), anyhow::Error> {
-    let treasury_address = ore_api::state::treasury_pda().0;
-    let config_address = ore_api::state::config_pda().0;
-    let board_address = ore_api::state::board_pda().0;
-    let address = pubkey!("pqspJ298ryBjazPAr95J9sULCVpZe3HbZTWkbC1zrkS");
-    let miner_address = ore_api::state::miner_pda(address).0;
-    let round = round_pda(31460).0;
-    println!("Round: {}", round);
-    println!("Treasury: {}", treasury_address);
-    println!("Config: {}", config_address);
-    println!("Board: {}", board_address);
-    println!("Miner: {}", miner_address);
-    Ok(())
-}
-
-async fn claim(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-) -> Result<(), anyhow::Error> {
-    let ix_sol = ore_api::sdk::claim_sol(payer.pubkey());
-    let ix_ore = ore_api::sdk::claim_ore(payer.pubkey());
-    submit_transaction(rpc, payer, &[ix_sol, ix_ore]).await?;
-    Ok(())
-}
-
-async fn buyback(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-) -> Result<(), anyhow::Error> {
-    // Get swap amount.
-    let treasury = get_treasury(rpc).await?;
-    let amount = treasury.balance.min(10 * LAMPORTS_PER_SOL);
-
-    // Build quote request.
-    const INPUT_MINT: Pubkey = pubkey!("So11111111111111111111111111111111111111112");
-    const OUTPUT_MINT: Pubkey = pubkey!("oreoU2P8bN6jkk3jbaiVxYnG1dCXcYxwhwyK9jSybcp");
-    let api_base_url =
-        std::env::var("API_BASE_URL").unwrap_or("https://lite-api.jup.ag/swap/v1".into());
-    let jupiter_swap_api_client = JupiterSwapApiClient::new(api_base_url);
-    let quote_request = QuoteRequest {
-        amount,
-        input_mint: INPUT_MINT,
-        output_mint: OUTPUT_MINT,
-        max_accounts: Some(55),
-        ..QuoteRequest::default()
-    };
-
-    // GET /quote
-    let quote_response = match jupiter_swap_api_client.quote(&quote_request).await {
-        Ok(quote_response) => quote_response,
-        Err(e) => {
-            println!("quote failed: {e:#?}");
-            return Err(anyhow::anyhow!("quote failed: {e:#?}"));
-        }
-    };
-
-    // GET /swap/instructions
-    let treasury_address = ore_api::state::treasury_pda().0;
-    let response = jupiter_swap_api_client
-        .swap_instructions(&SwapRequest {
-            user_public_key: treasury_address,
-            quote_response,
-            config: TransactionConfig {
-                skip_user_accounts_rpc_calls: true,
-                wrap_and_unwrap_sol: false,
-                dynamic_compute_unit_limit: true,
-                dynamic_slippage: Some(DynamicSlippageSettings {
-                    min_bps: Some(50),
-                    max_bps: Some(1000),
-                }),
-                ..TransactionConfig::default()
-            },
-        })
-        .await
-        .unwrap();
-
-    let address_lookup_table_accounts =
-        get_address_lookup_table_accounts(rpc, response.address_lookup_table_addresses)
-            .await
-            .unwrap();
-
-    // Build transaction.
-    let wrap_ix = ore_api::sdk::wrap(payer.pubkey(), u64::MAX);
-    let buyback_ix = ore_api::sdk::buyback(
-        payer.pubkey(),
-        &response.swap_instruction.accounts,
-        &response.swap_instruction.data,
-    );
-    simulate_transaction_with_address_lookup_tables(
-        rpc,
-        payer,
-        &[wrap_ix, buyback_ix],
-        address_lookup_table_accounts,
-    )
-    .await;
-
-    Ok(())
-}
-
-#[allow(dead_code)]
-pub async fn get_address_lookup_table_accounts(
-    rpc_client: &RpcClient,
-    addresses: Vec<Pubkey>,
-) -> Result<Vec<AddressLookupTableAccount>, anyhow::Error> {
-    let mut accounts = Vec::new();
-    for key in addresses {
-        if let Ok(account) = rpc_client.get_account(&key).await {
-            if let Ok(address_lookup_table_account) = AddressLookupTable::deserialize(&account.data)
-            {
-                accounts.push(AddressLookupTableAccount {
-                    key,
-                    addresses: address_lookup_table_account.addresses.to_vec(),
-                });
+    /// Wait for rate limit and track request
+    pub async fn wait_for_request(&self) -> Result<()> {
+        // Check and reset daily counter if needed
+        {
+            let mut day_start = self.day_start.lock().await;
+            if day_start.elapsed() > Duration::from_secs(86400) {
+                *day_start = Instant::now();
+                self.daily_requests.store(0, Ordering::Relaxed);
+                println!("Daily request counter reset");
             }
         }
-    }
-    Ok(accounts)
-}
 
-pub const ORE_VAR_ADDRESS: Pubkey = pubkey!("BWCaDY96Xe4WkFq1M7UiCCRcChsJ3p51L5KrGzhxgm2E");
-
-async fn reset(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-) -> Result<(), anyhow::Error> {
-    let board = get_board(rpc).await?;
-    let var = get_var(rpc, ORE_VAR_ADDRESS).await?;
-
-    println!("Var: {:?}", var);
-
-    let client = reqwest::Client::new();
-    let url = format!("https://entropy-api.onrender.com/var/{ORE_VAR_ADDRESS}/seed");
-    let response = client
-        .get(url)
-        .send()
-        .await?
-        .json::<entropy_types::response::GetSeedResponse>()
-        .await?;
-    println!("Entropy seed: {:?}", response);
-
-    let config = get_config(rpc).await?;
-    let sample_ix = entropy_api::sdk::sample(payer.pubkey(), ORE_VAR_ADDRESS);
-    let reveal_ix = entropy_api::sdk::reveal(payer.pubkey(), ORE_VAR_ADDRESS, response.seed);
-    let reset_ix = ore_api::sdk::reset(
-        payer.pubkey(),
-        ADMIN_FEE_COLLECTOR,
-        board.round_id,
-        Pubkey::default(),
-    );
-    let sig = submit_transaction(rpc, payer, &[sample_ix, reveal_ix, reset_ix]).await?;
-    println!("Reset: {}", sig);
-
-    Ok(())
-}
-
-async fn deploy(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-) -> Result<(), anyhow::Error> {
-    let amount = std::env::var("AMOUNT").expect("Missing AMOUNT env var");
-    let amount = u64::from_str(&amount).expect("Invalid AMOUNT");
-    let square_id = std::env::var("SQUARE").expect("Missing SQUARE env var");
-    let square_id = u64::from_str(&square_id).expect("Invalid SQUARE");
-    let board = get_board(rpc).await?;
-    let mut squares = [false; 25];
-    squares[square_id as usize] = true;
-    let ix = ore_api::sdk::deploy(
-        payer.pubkey(),
-        payer.pubkey(),
-        amount,
-        board.round_id,
-        squares,
-    );
-    submit_transaction(rpc, payer, &[ix]).await?;
-    Ok(())
-}
-
-async fn deploy_all(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-) -> Result<(), anyhow::Error> {
-    let amount = std::env::var("AMOUNT").expect("Missing AMOUNT env var");
-    let amount = u64::from_str(&amount).expect("Invalid AMOUNT");
-    let board = get_board(rpc).await?;
-    let squares = [true; 25];
-    let ix = ore_api::sdk::deploy(
-        payer.pubkey(),
-        payer.pubkey(),
-        board.round_id,
-        amount,
-        squares,
-    );
-    submit_transaction(rpc, payer, &[ix]).await?;
-    Ok(())
-}
-
-async fn set_admin(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-) -> Result<(), anyhow::Error> {
-    let ix = ore_api::sdk::set_admin(payer.pubkey(), payer.pubkey());
-    submit_transaction(rpc, payer, &[ix]).await?;
-    Ok(())
-}
-
-async fn checkpoint(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-) -> Result<(), anyhow::Error> {
-    let authority = std::env::var("AUTHORITY").unwrap_or(payer.pubkey().to_string());
-    let authority = Pubkey::from_str(&authority).expect("Invalid AUTHORITY");
-    let miner = get_miner(rpc, authority).await?;
-    let ix = ore_api::sdk::checkpoint(payer.pubkey(), authority, miner.round_id);
-    submit_transaction(rpc, payer, &[ix]).await?;
-    Ok(())
-}
-
-async fn checkpoint_all(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-) -> Result<(), anyhow::Error> {
-    let clock = get_clock(rpc).await?;
-    let miners = get_miners(rpc).await?;
-    let mut expiry_slots = HashMap::new();
-    let mut ixs = vec![];
-    for (i, (_address, miner)) in miners.iter().enumerate() {
-        if miner.checkpoint_id < miner.round_id {
-            // Log the expiry slot for the round.
-            if !expiry_slots.contains_key(&miner.round_id) {
-                if let Ok(round) = get_round(rpc, miner.round_id).await {
-                    expiry_slots.insert(miner.round_id, round.expires_at);
-                }
-            }
-
-            // Get the expiry slot for the round.
-            let Some(expires_at) = expiry_slots.get(&miner.round_id) else {
-                continue;
-            };
-
-            // If we are in fee collection period, checkpoint the miner.
-            if clock.slot >= expires_at - TWELVE_HOURS_SLOTS {
-                println!(
-                    "[{}/{}] Checkpoint miner: {} ({} s)",
-                    i + 1,
-                    miners.len(),
-                    miner.authority,
-                    (expires_at - clock.slot) as f64 * 0.4
-                );
-                ixs.push(ore_api::sdk::checkpoint(
-                    payer.pubkey(),
-                    miner.authority,
-                    miner.round_id,
-                ));
-            }
-        }
-    }
-
-    // Batch and submit the instructions.
-    while !ixs.is_empty() {
-        let batch = ixs
-            .drain(..std::cmp::min(10, ixs.len()))
-            .collect::<Vec<Instruction>>();
-        submit_transaction(rpc, payer, &batch).await?;
-    }
-
-    Ok(())
-}
-
-async fn close_all(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-) -> Result<(), anyhow::Error> {
-    let rounds = get_rounds(rpc).await?;
-    let mut ixs = vec![];
-    let clock = get_clock(rpc).await?;
-    for (_i, (_address, round)) in rounds.iter().enumerate() {
-        if clock.slot >= round.expires_at {
-            ixs.push(ore_api::sdk::close(
-                payer.pubkey(),
-                round.id,
-                round.rent_payer,
+        // Check daily limit
+        let daily_count = self.daily_requests.load(Ordering::Relaxed);
+        if daily_count >= MAX_DAILY_REQUESTS {
+            return Err(anyhow::anyhow!(
+                "Daily request limit reached ({}/{}). Please wait until tomorrow.",
+                daily_count, MAX_DAILY_REQUESTS
             ));
         }
-    }
 
-    // Batch and submit the instructions.
-    while !ixs.is_empty() {
-        let batch = ixs
-            .drain(..std::cmp::min(12, ixs.len()))
-            .collect::<Vec<Instruction>>();
-        // simulate_transaction(rpc, payer, &batch).await;
-        submit_transaction(rpc, payer, &batch).await?;
-    }
-
-    Ok(())
-}
-
-async fn log_automation(rpc: &RpcClient) -> Result<(), anyhow::Error> {
-    let authority = std::env::var("AUTHORITY").expect("Missing AUTHORITY env var");
-    let authority = Pubkey::from_str(&authority).expect("Invalid AUTHORITY");
-    let address = automation_pda(authority).0;
-    let automation = get_automation(rpc, address).await?;
-    let account_balance = rpc.get_balance(&address).await?;
-    let size = 8 + std::mem::size_of::<Automation>();
-    let required_rent = Rent::default().minimum_balance(size);
-    println!("Automation");
-    println!("  address: {}", address);
-    println!("  amount: {} SOL", lamports_to_sol(automation.amount));
-    println!("  required rent: {} SOL", lamports_to_sol(required_rent));
-    println!("  authority: {}", automation.authority);
-    println!("  balance: {} SOL", lamports_to_sol(automation.balance));
-    println!("  lamports: {} SOL", lamports_to_sol(account_balance));
-    println!("  executor: {}", automation.executor);
-    println!("  fee: {} SOL", lamports_to_sol(automation.fee));
-    println!("  mask: {}", automation.mask);
-    println!("  strategy: {}", automation.strategy);
-    println!("  reload: {}", automation.reload);
-    Ok(())
-}
-
-async fn log_automations(rpc: &RpcClient) -> Result<(), anyhow::Error> {
-    let automations = get_automations(rpc).await?;
-    for (i, (address, automation)) in automations.iter().enumerate() {
-        println!("[{}/{}] {}", i + 1, automations.len(), address);
-        println!("  authority: {}", automation.authority);
-        println!("  balance: {}", automation.balance);
-        println!("  executor: {}", automation.executor);
-        println!("  fee: {}", automation.fee);
-        println!("  mask: {}", automation.mask);
-        println!("  strategy: {}", automation.strategy);
-        println!();
-    }
-    Ok(())
-}
-
-async fn log_treasury(rpc: &RpcClient) -> Result<(), anyhow::Error> {
-    let treasury_address = ore_api::state::treasury_pda().0;
-    let treasury = get_treasury(rpc).await?;
-    println!("Treasury");
-    println!("  address: {}", treasury_address);
-    println!("  buffer_a: {}", treasury.buffer_a);
-    println!("  balance: {} SOL", lamports_to_sol(treasury.balance));
-    println!(
-        "  motherlode: {} ORE",
-        amount_to_ui_amount(treasury.motherlode, TOKEN_DECIMALS)
-    );
-    println!(
-        "  miner_rewards_factor: {}",
-        treasury.miner_rewards_factor.to_i80f48().to_string()
-    );
-    println!(
-        "  stake_rewards_factor: {}",
-        treasury.stake_rewards_factor.to_i80f48().to_string()
-    );
-    println!("  buffer_b: {}", treasury.buffer_b);
-    println!(
-        "  total_refined: {} ORE",
-        amount_to_ui_amount(treasury.total_refined, TOKEN_DECIMALS)
-    );
-    println!(
-        "  total_staked: {} ORE",
-        amount_to_ui_amount(treasury.total_staked, TOKEN_DECIMALS)
-    );
-    println!(
-        "  total_unclaimed: {} ORE",
-        amount_to_ui_amount(treasury.total_unclaimed, TOKEN_DECIMALS)
-    );
-    Ok(())
-}
-
-async fn log_round(rpc: &RpcClient) -> Result<(), anyhow::Error> {
-    let id = std::env::var("ID").expect("Missing ID env var");
-    let id = u64::from_str(&id).expect("Invalid ID");
-    let round_address = round_pda(id).0;
-    let round = get_round(rpc, id).await?;
-    let rng = round.rng();
-    println!("Round");
-    println!("  Address: {}", round_address);
-    println!("  Count: {:?}", round.count);
-    println!("  Deployed: {:?}", round.deployed);
-    println!("  Expires at: {}", round.expires_at);
-    println!("  Id: {:?}", round.id);
-    println!(
-        "  Motherlode: {} ORE",
-        amount_to_ui_amount(round.motherlode, TOKEN_DECIMALS)
-    );
-    println!("  Rent payer: {}", round.rent_payer);
-    println!("  Slot hash: {:?}", round.slot_hash);
-    println!("  Top miner: {:?}", round.top_miner);
-    println!(
-        "  Top miner reward: {} ORE",
-        amount_to_ui_amount(round.top_miner_reward, TOKEN_DECIMALS)
-    );
-    println!("  Total miners: {}", round.total_miners);
-    println!(
-        "  Total deployed: {} SOL",
-        lamports_to_sol(round.total_deployed)
-    );
-    println!(
-        "  Total vaulted: {} SOL",
-        lamports_to_sol(round.total_vaulted)
-    );
-    println!(
-        "  Total winnings: {} SOL",
-        lamports_to_sol(round.total_winnings)
-    );
-    if let Some(rng) = rng {
-        println!("  Winning square: {}", round.winning_square(rng));
-    }
-    // if round.slot_hash != [0; 32] {
-    //     println!("  Winning square: {}", get_winning_square(&round.slot_hash));
-    // }
-    Ok(())
-}
-
-async fn log_miner(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-) -> Result<(), anyhow::Error> {
-    let authority = std::env::var("AUTHORITY").unwrap_or(payer.pubkey().to_string());
-    let authority = Pubkey::from_str(&authority).expect("Invalid AUTHORITY");
-    let treasury = get_treasury(&rpc).await?;
-    let miner_address = ore_api::state::miner_pda(authority).0;
-    let mut miner = get_miner(&rpc, authority).await?;
-    miner.update_rewards(&treasury);
-    println!("Miner");
-    println!("  address: {}", miner_address);
-    println!("  authority: {}", authority);
-    println!("  deployed: {:?}", miner.deployed);
-    println!("  cumulative: {:?}", miner.cumulative);
-    println!("  rewards_sol: {} SOL", lamports_to_sol(miner.rewards_sol));
-    println!(
-        "  rewards_ore: {} ORE",
-        amount_to_ui_amount(miner.rewards_ore, TOKEN_DECIMALS)
-    );
-    println!(
-        "  refined_ore: {} ORE",
-        amount_to_ui_amount(miner.refined_ore, TOKEN_DECIMALS)
-    );
-    println!("  round_id: {}", miner.round_id);
-    println!("  checkpoint_id: {}", miner.checkpoint_id);
-    println!(
-        "  lifetime_rewards_sol: {} SOL",
-        lamports_to_sol(miner.lifetime_rewards_sol)
-    );
-    println!(
-        "  lifetime_rewards_ore: {} ORE",
-        amount_to_ui_amount(miner.lifetime_rewards_ore, TOKEN_DECIMALS)
-    );
-    Ok(())
-}
-
-async fn log_clock(rpc: &RpcClient) -> Result<(), anyhow::Error> {
-    let clock = get_clock(&rpc).await?;
-    println!("Clock");
-    println!("  slot: {}", clock.slot);
-    println!("  epoch_start_timestamp: {}", clock.epoch_start_timestamp);
-    println!("  epoch: {}", clock.epoch);
-    println!("  leader_schedule_epoch: {}", clock.leader_schedule_epoch);
-    println!("  unix_timestamp: {}", clock.unix_timestamp);
-    Ok(())
-}
-
-async fn log_config(rpc: &RpcClient) -> Result<(), anyhow::Error> {
-    let config = get_config(&rpc).await?;
-    println!("Config");
-    println!("  admin: {}", config.admin);
-    Ok(())
-}
-
-async fn log_board(rpc: &RpcClient) -> Result<(), anyhow::Error> {
-    let board = get_board(&rpc).await?;
-    let clock = get_clock(&rpc).await?;
-    print_board(board, &clock);
-    Ok(())
-}
-
-fn print_board(board: Board, clock: &Clock) {
-    let current_slot = clock.slot;
-    println!("Board");
-    println!("  Id: {:?}", board.round_id);
-    println!("  Start slot: {}", board.start_slot);
-    println!("  End slot: {}", board.end_slot);
-    println!(
-        "  Time remaining: {} sec",
-        (board.end_slot.saturating_sub(current_slot) as f64) * 0.4
-    );
-    println!("  Epoch id: {:?}", board.epoch_id);
-}
-
-async fn get_automation(rpc: &RpcClient, address: Pubkey) -> Result<Automation, anyhow::Error> {
-    let account = rpc.get_account(&address).await?;
-    let automation = Automation::try_from_bytes(&account.data)?;
-    Ok(*automation)
-}
-
-async fn get_automations(rpc: &RpcClient) -> Result<Vec<(Pubkey, Automation)>, anyhow::Error> {
-    const REGOLITH_EXECUTOR: Pubkey = pubkey!("HNWhK5f8RMWBqcA7mXJPaxdTPGrha3rrqUrri7HSKb3T");
-    let filter = RpcFilterType::Memcmp(Memcmp::new_base58_encoded(
-        56,
-        &REGOLITH_EXECUTOR.to_bytes(),
-    ));
-    let automations = get_program_accounts::<Automation>(rpc, ore_api::ID, vec![filter]).await?;
-    Ok(automations)
-}
-
-async fn get_board(rpc: &RpcClient) -> Result<Board, anyhow::Error> {
-    let board_pda = ore_api::state::board_pda();
-    let account = rpc.get_account(&board_pda.0).await?;
-    let board = Board::try_from_bytes(&account.data)?;
-    Ok(*board)
-}
-
-async fn get_var(rpc: &RpcClient, address: Pubkey) -> Result<Var, anyhow::Error> {
-    let account = rpc.get_account(&address).await?;
-    let var = Var::try_from_bytes(&account.data)?;
-    Ok(*var)
-}
-
-async fn get_round(rpc: &RpcClient, id: u64) -> Result<Round, anyhow::Error> {
-    let round_pda = ore_api::state::round_pda(id);
-    let account = rpc.get_account(&round_pda.0).await?;
-    let round = Round::try_from_bytes(&account.data)?;
-    Ok(*round)
-}
-
-async fn get_treasury(rpc: &RpcClient) -> Result<Treasury, anyhow::Error> {
-    let treasury_pda = ore_api::state::treasury_pda();
-    let account = rpc.get_account(&treasury_pda.0).await?;
-    let treasury = Treasury::try_from_bytes(&account.data)?;
-    Ok(*treasury)
-}
-
-async fn get_config(rpc: &RpcClient) -> Result<Config, anyhow::Error> {
-    let config_pda = ore_api::state::config_pda();
-    let account = rpc.get_account(&config_pda.0).await?;
-    let config = Config::try_from_bytes(&account.data)?;
-    Ok(*config)
-}
-
-async fn get_miner(rpc: &RpcClient, authority: Pubkey) -> Result<Miner, anyhow::Error> {
-    let miner_pda = ore_api::state::miner_pda(authority);
-    let account = rpc.get_account(&miner_pda.0).await?;
-    let miner = Miner::try_from_bytes(&account.data)?;
-    Ok(*miner)
-}
-
-async fn get_clock(rpc: &RpcClient) -> Result<Clock, anyhow::Error> {
-    let data = rpc.get_account_data(&solana_sdk::sysvar::clock::ID).await?;
-    let clock = bincode::deserialize::<Clock>(&data)?;
-    Ok(clock)
-}
-
-async fn get_stake(rpc: &RpcClient, authority: Pubkey) -> Result<Stake, anyhow::Error> {
-    let stake_pda = ore_api::state::stake_pda(authority);
-    let account = rpc.get_account(&stake_pda.0).await?;
-    let stake = Stake::try_from_bytes(&account.data)?;
-    Ok(*stake)
-}
-
-async fn get_rounds(rpc: &RpcClient) -> Result<Vec<(Pubkey, Round)>, anyhow::Error> {
-    let rounds = get_program_accounts::<Round>(rpc, ore_api::ID, vec![]).await?;
-    Ok(rounds)
-}
-
-#[allow(dead_code)]
-async fn get_miners(rpc: &RpcClient) -> Result<Vec<(Pubkey, Miner)>, anyhow::Error> {
-    let miners = get_program_accounts::<Miner>(rpc, ore_api::ID, vec![]).await?;
-    Ok(miners)
-}
-
-async fn get_miners_participating(
-    rpc: &RpcClient,
-    round_id: u64,
-) -> Result<Vec<(Pubkey, Miner)>, anyhow::Error> {
-    let filter = RpcFilterType::Memcmp(Memcmp::new_base58_encoded(512, &round_id.to_le_bytes()));
-    let miners = get_program_accounts::<Miner>(rpc, ore_api::ID, vec![filter]).await?;
-    Ok(miners)
-}
-
-// fn get_winning_square(slot_hash: &[u8]) -> u64 {
-//     // Use slot hash to generate a random u64
-//     let r1 = u64::from_le_bytes(slot_hash[0..8].try_into().unwrap());
-//     let r2 = u64::from_le_bytes(slot_hash[8..16].try_into().unwrap());
-//     let r3 = u64::from_le_bytes(slot_hash[16..24].try_into().unwrap());
-//     let r4 = u64::from_le_bytes(slot_hash[24..32].try_into().unwrap());
-//     let r = r1 ^ r2 ^ r3 ^ r4;
-//     // Returns a value in the range [0, 24] inclusive
-//     r % 25
-// }
-
-#[allow(dead_code)]
-async fn simulate_transaction(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-    instructions: &[solana_sdk::instruction::Instruction],
-) {
-    let blockhash = rpc.get_latest_blockhash().await.unwrap();
-    let x = rpc
-        .simulate_transaction(&Transaction::new_signed_with_payer(
-            instructions,
-            Some(&payer.pubkey()),
-            &[payer],
-            blockhash,
-        ))
-        .await;
-    println!("Simulation result: {:?}", x);
-}
-
-#[allow(dead_code)]
-async fn simulate_transaction_with_address_lookup_tables(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-    instructions: &[solana_sdk::instruction::Instruction],
-    address_lookup_table_accounts: Vec<AddressLookupTableAccount>,
-) {
-    let blockhash = rpc.get_latest_blockhash().await.unwrap();
-    let tx = VersionedTransaction {
-        signatures: vec![Signature::default()],
-        message: VersionedMessage::V0(
-            Message::try_compile(
-                &payer.pubkey(),
-                instructions,
-                &address_lookup_table_accounts,
-                blockhash,
-            )
-            .unwrap(),
-        ),
-    };
-    let s = tx.sanitize();
-    println!("Sanitize result: {:?}", s);
-    s.unwrap();
-    let x = rpc.simulate_transaction(&tx).await;
-    println!("Simulation result: {:?}", x);
-}
-
-#[allow(unused)]
-async fn submit_transaction_batches(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-    mut ixs: Vec<solana_sdk::instruction::Instruction>,
-    batch_size: usize,
-) -> Result<(), anyhow::Error> {
-    // Batch and submit the instructions.
-    while !ixs.is_empty() {
-        let batch = ixs
-            .drain(..std::cmp::min(batch_size, ixs.len()))
-            .collect::<Vec<Instruction>>();
-        submit_transaction_no_confirm(rpc, payer, &batch).await?;
-        // submit_transaction(rpc, payer, &batch).await?;
-    }
-    Ok(())
-}
-
-#[allow(unused)]
-async fn simulate_transaction_batches(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-    mut ixs: Vec<solana_sdk::instruction::Instruction>,
-    batch_size: usize,
-) -> Result<(), anyhow::Error> {
-    // Batch and submit the instructions.
-    while !ixs.is_empty() {
-        let batch = ixs
-            .drain(..std::cmp::min(batch_size, ixs.len()))
-            .collect::<Vec<Instruction>>();
-        simulate_transaction(rpc, payer, &batch).await;
-    }
-    Ok(())
-}
-
-async fn submit_transaction(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-    instructions: &[solana_sdk::instruction::Instruction],
-) -> Result<solana_sdk::signature::Signature, anyhow::Error> {
-    let blockhash = rpc.get_latest_blockhash().await?;
-    let mut all_instructions = vec![
-        ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
-        ComputeBudgetInstruction::set_compute_unit_price(1_000_000),
-    ];
-    all_instructions.extend_from_slice(instructions);
-    let transaction = Transaction::new_signed_with_payer(
-        &all_instructions,
-        Some(&payer.pubkey()),
-        &[payer],
-        blockhash,
-    );
-
-    match rpc.send_and_confirm_transaction(&transaction).await {
-        Ok(signature) => {
-            println!("Transaction submitted: {:?}", signature);
-            Ok(signature)
+        // Apply backoff if we recently hit a rate limit
+        let backoff = self.current_backoff.load(Ordering::Relaxed);
+        if backoff > 0 {
+            println!("Applying backoff delay: {}ms", backoff);
+            sleep(Duration::from_millis(backoff)).await;
         }
-        Err(e) => {
-            println!("Error submitting transaction: {:?}", e);
-            Err(e.into())
+
+        // Ensure minimum delay between requests
+        let mut last = self.last_request.lock().await;
+        let elapsed = last.elapsed();
+        let min_delay = Duration::from_millis(MIN_REQUEST_DELAY_MS);
+
+        if elapsed < min_delay {
+            let wait_time = min_delay - elapsed;
+            sleep(wait_time).await;
+        }
+
+        // Update tracking
+        *last = Instant::now();
+        self.daily_requests.fetch_add(1, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// Handle rate limit error (429)
+    pub fn on_rate_limit(&self) {
+        let current = self.current_backoff.load(Ordering::Relaxed);
+        let new_backoff = if current == 0 {
+            INITIAL_BACKOFF_MS
+        } else {
+            (current * 2).min(MAX_BACKOFF_MS)
+        };
+        self.current_backoff.store(new_backoff, Ordering::Relaxed);
+        println!("Rate limited! Increasing backoff to {}ms", new_backoff);
+    }
+
+    /// Handle successful request
+    pub fn on_success(&self) {
+        // Gradually reduce backoff on success
+        let current = self.current_backoff.load(Ordering::Relaxed);
+        if current > 0 {
+            let new_backoff = current / 2;
+            self.current_backoff.store(new_backoff, Ordering::Relaxed);
         }
     }
-}
 
-async fn submit_transaction_no_confirm(
-    rpc: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-    instructions: &[solana_sdk::instruction::Instruction],
-) -> Result<solana_sdk::signature::Signature, anyhow::Error> {
-    let blockhash = rpc.get_latest_blockhash().await?;
-    let mut all_instructions = vec![
-        ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
-        ComputeBudgetInstruction::set_compute_unit_price(1_000_000),
-    ];
-    all_instructions.extend_from_slice(instructions);
-    let transaction = Transaction::new_signed_with_payer(
-        &all_instructions,
-        Some(&payer.pubkey()),
-        &[payer],
-        blockhash,
-    );
-
-    match rpc.send_transaction(&transaction).await {
-        Ok(signature) => {
-            println!("Transaction submitted: {:?}", signature);
-            Ok(signature)
-        }
-        Err(e) => {
-            println!("Error submitting transaction: {:?}", e);
-            Err(e.into())
-        }
+    /// Get current stats
+    pub fn stats(&self) -> (u64, u64) {
+        let daily = self.daily_requests.load(Ordering::Relaxed);
+        let backoff = self.current_backoff.load(Ordering::Relaxed);
+        (daily, backoff)
     }
 }
 
-pub async fn get_program_accounts<T>(
-    client: &RpcClient,
-    program_id: Pubkey,
-    filters: Vec<RpcFilterType>,
-) -> Result<Vec<(Pubkey, T)>, anyhow::Error>
-where
-    T: AccountDeserialize + Discriminator + Clone,
-{
-    let mut all_filters = vec![RpcFilterType::Memcmp(Memcmp::new_base58_encoded(
-        0,
-        &T::discriminator().to_le_bytes(),
-    ))];
-    all_filters.extend(filters);
-    let result = client
-        .get_program_accounts_with_config(
-            &program_id,
-            RpcProgramAccountsConfig {
-                filters: Some(all_filters),
-                account_config: RpcAccountInfoConfig {
-                    encoding: Some(UiAccountEncoding::Base64),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
-        .await;
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-    match result {
-        Ok(accounts) => {
-            let accounts = accounts
-                .into_iter()
-                .filter_map(|(pubkey, account)| {
-                    if let Ok(account) = T::try_from_bytes(&account.data) {
-                        Some((pubkey, account.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            Ok(accounts)
-        }
-        Err(err) => match err.kind {
-            ClientErrorKind::Reqwest(err) => {
-                if let Some(status_code) = err.status() {
-                    if status_code == StatusCode::GONE {
-                        panic!(
-                                "\n{} Your RPC provider does not support the getProgramAccounts endpoint, needed to execute this command. Please use a different RPC provider.\n",
-                                "ERROR"
-                            );
-                    }
+// =============================================================================
+// Algorand Client with Rate Limiting
+// =============================================================================
+
+/// Algorand client wrapper with built-in rate limiting
+pub struct AlgoClient {
+    algod: Algod,
+    rate_limiter: Arc<RateLimiter>,
+    app_id: u64,
+}
+
+impl AlgoClient {
+    pub fn new(algod_url: &str, algod_token: &str, app_id: u64) -> Result<Self> {
+        let algod = Algod::new(algod_url, algod_token)?;
+        Ok(Self {
+            algod,
+            rate_limiter: Arc::new(RateLimiter::new()),
+            app_id,
+        })
+    }
+
+    /// Execute a request with rate limiting and retry logic
+    async fn with_rate_limit<T, F, Fut>(&self, operation: F) -> Result<T>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let mut retries = 0;
+
+        loop {
+            // Wait for rate limit
+            self.rate_limiter.wait_for_request().await?;
+
+            // Execute operation
+            match operation().await {
+                Ok(result) => {
+                    self.rate_limiter.on_success();
+                    return Ok(result);
                 }
-                return Err(anyhow::anyhow!("Failed to get program accounts: {}", err));
+                Err(e) => {
+                    let error_str = e.to_string().to_lowercase();
+
+                    // Check if it's a rate limit error
+                    if error_str.contains("429") || error_str.contains("too many requests") || error_str.contains("rate limit") {
+                        self.rate_limiter.on_rate_limit();
+                        retries += 1;
+
+                        if retries >= MAX_RETRIES {
+                            return Err(anyhow::anyhow!(
+                                "Max retries ({}) exceeded for rate-limited request",
+                                MAX_RETRIES
+                            ));
+                        }
+
+                        println!("Retry {}/{} after rate limit...", retries, MAX_RETRIES);
+                        continue;
+                    }
+
+                    // Not a rate limit error, return immediately
+                    return Err(e);
+                }
             }
-            _ => return Err(anyhow::anyhow!("Failed to get program accounts: {}", err)),
-        },
+        }
     }
+
+    /// Get node status
+    pub async fn status(&self) -> Result<algonaut::algod::v2::message::NodeStatus> {
+        self.with_rate_limit(|| async {
+            self.algod.status().await.map_err(|e| anyhow::anyhow!("{}", e))
+        }).await
+    }
+
+    /// Get account information
+    pub async fn account_information(&self, address: &Address) -> Result<algonaut::algod::v2::message::Account> {
+        let addr = *address;
+        self.with_rate_limit(|| async {
+            self.algod.account_information(&addr).await.map_err(|e| anyhow::anyhow!("{}", e))
+        }).await
+    }
+
+    /// Get application box
+    pub async fn application_box(&self, box_name: &[u8]) -> Result<algonaut::algod::v2::message::Box> {
+        let name = box_name.to_vec();
+        let app_id = self.app_id;
+        self.with_rate_limit(|| async {
+            self.algod.application_box(app_id, &name).await.map_err(|e| anyhow::anyhow!("{}", e))
+        }).await
+    }
+
+    /// Get suggested transaction params
+    pub async fn suggested_transaction_params(&self) -> Result<algonaut::algod::v2::message::TransactionParams> {
+        self.with_rate_limit(|| async {
+            self.algod.suggested_transaction_params().await.map_err(|e| anyhow::anyhow!("{}", e))
+        }).await
+    }
+
+    /// Broadcast signed transaction
+    pub async fn broadcast_signed_transaction(&self, signed_txn: &algonaut::transaction::SignedTransaction) -> Result<algonaut::algod::v2::message::PendingTransaction> {
+        // Clone the signed transaction for the closure
+        let txn = signed_txn.clone();
+        self.with_rate_limit(|| async {
+            self.algod.broadcast_signed_transaction(&txn).await.map_err(|e| anyhow::anyhow!("{}", e))
+        }).await
+    }
+
+    /// Get pending transaction info
+    pub async fn pending_transaction_with_id(&self, tx_id: &str) -> Result<algonaut::algod::v2::message::PendingTransaction> {
+        let id = tx_id.to_string();
+        self.with_rate_limit(|| async {
+            self.algod.pending_transaction_with_id(&id).await.map_err(|e| anyhow::anyhow!("{}", e))
+        }).await
+    }
+
+    /// Get rate limiter stats
+    pub fn rate_limit_stats(&self) -> (u64, u64) {
+        self.rate_limiter.stats()
+    }
+}
+
+// =============================================================================
+// Configuration
+// =============================================================================
+
+/// Algorand node configuration
+struct AlgoConfig {
+    algod_url: String,
+    algod_token: String,
+    app_id: u64,
+    network: String,
+}
+
+impl AlgoConfig {
+    fn from_env() -> Self {
+        let network = std::env::var("ALGO_NETWORK").unwrap_or_else(|_| "mainnet".into());
+
+        // Default to Nodely endpoints based on network
+        let default_url = match network.as_str() {
+            "testnet" => NODELY_TESTNET_ALGOD,
+            _ => NODELY_MAINNET_ALGOD,
+        };
+
+        Self {
+            algod_url: std::env::var("ALGOD_URL").unwrap_or_else(|_| default_url.into()),
+            // Nodely free tier doesn't require a token
+            algod_token: std::env::var("ALGOD_TOKEN").unwrap_or_else(|_| "".into()),
+            app_id: std::env::var("APP_ID").unwrap_or_else(|_| "0".into()).parse().unwrap_or(0),
+            network,
+        }
+    }
+}
+
+// =============================================================================
+// Main
+// =============================================================================
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config = AlgoConfig::from_env();
+
+    println!("fPOW CLI - Algorand Client");
+    println!("Network: {}", config.network);
+    println!("Endpoint: {}", config.algod_url);
+    println!();
+
+    // Read account from mnemonic
+    let mnemonic = std::env::var("MNEMONIC").expect("Missing MNEMONIC env var");
+    let account = Account::from_mnemonic(&mnemonic)?;
+
+    // Create rate-limited Algod client
+    let client = AlgoClient::new(&config.algod_url, &config.algod_token, config.app_id)?;
+
+    // Process command
+    let command = std::env::var("COMMAND").unwrap_or_else(|_| "help".into());
+    match command.as_str() {
+        "status" => {
+            status(&client).await?;
+        }
+        "account" => {
+            log_account(&client, &account).await?;
+        }
+        "board" => {
+            log_board(&client).await?;
+        }
+        "treasury" => {
+            log_treasury(&client).await?;
+        }
+        "miner" => {
+            log_miner(&client, &account).await?;
+        }
+        "claim_algo" => {
+            claim_algo(&client, &account).await?;
+        }
+        "claim_fpow" => {
+            claim_fpow(&client, &account).await?;
+        }
+        "deploy" => {
+            deploy(&client, &account).await?;
+        }
+        "deposit" => {
+            deposit(&client, &account).await?;
+        }
+        "withdraw" => {
+            withdraw(&client, &account).await?;
+        }
+        "claim_yield" => {
+            claim_yield(&client, &account).await?;
+        }
+        "stats" => {
+            let (daily, backoff) = client.rate_limit_stats();
+            println!("Rate Limit Stats");
+            println!("  Daily requests: {}/{}", daily, MAX_DAILY_REQUESTS);
+            println!("  Current backoff: {}ms", backoff);
+        }
+        "help" | _ => {
+            println!("Available commands:");
+            println!("  status       - Show Algorand node status");
+            println!("  account      - Show account info");
+            println!("  board        - Show board state");
+            println!("  treasury     - Show treasury state");
+            println!("  miner        - Show miner state");
+            println!("  claim_algo   - Claim ALGO rewards");
+            println!("  claim_fpow   - Claim fPOW rewards");
+            println!("  deploy       - Deploy ALGO to squares");
+            println!("  deposit      - Deposit fPOW stake");
+            println!("  withdraw     - Withdraw fPOW stake");
+            println!("  claim_yield  - Claim staking yield");
+            println!("  stats        - Show rate limit stats");
+            println!();
+            println!("Environment variables:");
+            println!("  MNEMONIC      - Wallet mnemonic (required)");
+            println!("  APP_ID        - fPOW application ID");
+            println!("  ALGO_NETWORK  - Network: mainnet (default) or testnet");
+            println!("  ALGOD_URL     - Custom Algod URL (default: Nodely)");
+            println!("  ALGOD_TOKEN   - Algod API token (optional for Nodely)");
+            println!();
+            println!("Rate Limiting:");
+            println!("  - Max {} requests/second", MAX_REQUESTS_PER_SECOND);
+            println!("  - Max {} requests/day", MAX_DAILY_REQUESTS);
+            println!("  - Automatic exponential backoff on 429 errors");
+        }
+    }
+
+    // Print final rate limit stats
+    let (daily, backoff) = client.rate_limit_stats();
+    if daily > 0 {
+        println!();
+        println!("Session stats: {} requests, {}ms backoff", daily, backoff);
+    }
+
+    Ok(())
+}
+
+// =============================================================================
+// Commands
+// =============================================================================
+
+/// Show Algorand node status
+async fn status(client: &AlgoClient) -> Result<()> {
+    let status = client.status().await?;
+    println!("Algorand Node Status");
+    println!("  Last round: {}", status.last_round);
+    println!("  Time since last round: {} ms", status.time_since_last_round.as_millis());
+    println!("  Catchup time: {} ms", status.catchup_time.as_millis());
+    Ok(())
+}
+
+/// Show account info
+async fn log_account(client: &AlgoClient, account: &Account) -> Result<()> {
+    let address = account.address();
+    let info = client.account_information(&address).await?;
+    println!("Account Info");
+    println!("  Address: {}", address);
+    println!("  Balance: {} ALGO", MicroAlgos(info.amount).to_algos());
+    println!("  Min balance: {} ALGO", MicroAlgos(info.min_balance).to_algos());
+    println!("  Pending rewards: {} ALGO", MicroAlgos(info.pending_rewards).to_algos());
+    Ok(())
+}
+
+/// Show board state from box storage
+async fn log_board(client: &AlgoClient) -> Result<()> {
+    let box_name = board_box_name();
+    match client.application_box(&box_name).await {
+        Ok(box_data) => {
+            println!("Board State");
+            println!("  Box name: {:?}", String::from_utf8_lossy(&box_name));
+            println!("  Data length: {} bytes", box_data.value.len());
+            if box_data.value.len() >= 32 {
+                let round_id = u64::from_le_bytes(box_data.value[0..8].try_into()?);
+                let start_round = u64::from_le_bytes(box_data.value[8..16].try_into()?);
+                let end_round = u64::from_le_bytes(box_data.value[16..24].try_into()?);
+                let epoch_id = u64::from_le_bytes(box_data.value[24..32].try_into()?);
+                println!("  Round ID: {}", round_id);
+                println!("  Start round: {}", start_round);
+                println!("  End round: {}", end_round);
+                println!("  Epoch ID: {}", epoch_id);
+            }
+        }
+        Err(e) => {
+            println!("Failed to get board box: {}", e);
+        }
+    }
+    Ok(())
+}
+
+/// Show treasury state from box storage
+async fn log_treasury(client: &AlgoClient) -> Result<()> {
+    let box_name = treasury_box_name();
+    match client.application_box(&box_name).await {
+        Ok(box_data) => {
+            println!("Treasury State");
+            println!("  Box name: {:?}", String::from_utf8_lossy(&box_name));
+            println!("  Data length: {} bytes", box_data.value.len());
+            if box_data.value.len() >= 8 {
+                let balance = u64::from_le_bytes(box_data.value[0..8].try_into()?);
+                println!("  Balance: {} microALGO", balance);
+            }
+        }
+        Err(e) => {
+            println!("Failed to get treasury box: {}", e);
+        }
+    }
+    Ok(())
+}
+
+/// Show miner state from box storage
+async fn log_miner(client: &AlgoClient, account: &Account) -> Result<()> {
+    let authority = std::env::var("AUTHORITY")
+        .map(|s| Address::from_str(&s).expect("Invalid AUTHORITY"))
+        .unwrap_or_else(|_| account.address());
+
+    let box_name = miner_box_name(&authority.0);
+    match client.application_box(&box_name).await {
+        Ok(box_data) => {
+            println!("Miner State");
+            println!("  Authority: {}", authority);
+            println!("  Box name length: {} bytes", box_name.len());
+            println!("  Data length: {} bytes", box_data.value.len());
+        }
+        Err(e) => {
+            println!("Failed to get miner box: {}", e);
+            println!("Miner account may not exist yet.");
+        }
+    }
+    Ok(())
+}
+
+/// Build and submit an application call transaction
+async fn submit_app_call(
+    client: &AlgoClient,
+    account: &Account,
+    method: FpowInstruction,
+    args: Vec<Vec<u8>>,
+    boxes: Vec<Vec<u8>>,
+) -> Result<String> {
+    // Get suggested parameters
+    let params = client.suggested_transaction_params().await?;
+
+    // Build method selector
+    let method_selector = {
+        use sha2::{Sha512_256, Digest};
+        let selector = method.method_selector();
+        let hash = Sha512_256::digest(selector.as_bytes());
+        hash[0..4].to_vec()
+    };
+
+    // Build application arguments
+    let mut app_args = vec![method_selector];
+    app_args.extend(args);
+
+    // Build box references
+    let app_id = std::env::var("APP_ID").unwrap_or_else(|_| "0".into()).parse().unwrap_or(0);
+    let box_refs: Vec<(u64, Vec<u8>)> = boxes.into_iter().map(|b| (app_id, b)).collect();
+
+    // Build transaction
+    let txn = TxnBuilder::with(
+        &params,
+        CallApplication::new(account.address(), app_id)
+            .app_arguments(app_args)
+            .boxes(box_refs)
+            .build(),
+    )
+    .build()?;
+
+    // Sign transaction
+    let signed_txn = account.sign_transaction(txn)?;
+
+    // Submit transaction (rate limited)
+    let pending = client.broadcast_signed_transaction(&signed_txn).await?;
+    println!("Transaction submitted: {}", pending.tx_id);
+
+    // Wait for confirmation (with polling delay for rate limiting)
+    loop {
+        sleep(Duration::from_millis(500)).await; // Rate-limited polling
+        match client.pending_transaction_with_id(&pending.tx_id).await {
+            Ok(confirmed) => {
+                if confirmed.confirmed_round.is_some() {
+                    println!("Transaction confirmed in round: {:?}", confirmed.confirmed_round);
+                    return Ok(pending.tx_id.to_string());
+                }
+            }
+            Err(e) => {
+                // Transaction may still be pending
+                if !e.to_string().contains("pending") {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+/// Claim ALGO rewards
+async fn claim_algo(client: &AlgoClient, account: &Account) -> Result<()> {
+    let miner_box = miner_box_name(&account.address().0);
+
+    println!("Claiming ALGO rewards...");
+    let tx_id = submit_app_call(
+        client,
+        account,
+        FpowInstruction::ClaimALGO,
+        vec![],
+        vec![miner_box],
+    )
+    .await?;
+    println!("Claim ALGO transaction: {}", tx_id);
+
+    Ok(())
+}
+
+/// Claim fPOW rewards
+async fn claim_fpow(client: &AlgoClient, account: &Account) -> Result<()> {
+    let miner_box = miner_box_name(&account.address().0);
+    let treasury_box = treasury_box_name();
+
+    println!("Claiming fPOW rewards...");
+    let tx_id = submit_app_call(
+        client,
+        account,
+        FpowInstruction::ClaimFPOW,
+        vec![],
+        vec![miner_box, treasury_box],
+    )
+    .await?;
+    println!("Claim fPOW transaction: {}", tx_id);
+
+    Ok(())
+}
+
+/// Deploy ALGO to squares
+async fn deploy(client: &AlgoClient, account: &Account) -> Result<()> {
+    let amount: u64 = std::env::var("AMOUNT")
+        .expect("Missing AMOUNT env var")
+        .parse()
+        .expect("Invalid AMOUNT");
+
+    let square: u64 = std::env::var("SQUARE")
+        .expect("Missing SQUARE env var")
+        .parse()
+        .expect("Invalid SQUARE");
+
+    let mask: u32 = 1 << square;
+
+    let miner_box = miner_box_name(&account.address().0);
+    let board_box = board_box_name();
+
+    println!("Deploying {} microALGO to square {}...", amount, square);
+    let tx_id = submit_app_call(
+        client,
+        account,
+        FpowInstruction::Deploy,
+        vec![
+            amount.to_be_bytes().to_vec(),
+            mask.to_be_bytes().to_vec(),
+        ],
+        vec![miner_box, board_box],
+    )
+    .await?;
+    println!("Deploy transaction: {}", tx_id);
+
+    Ok(())
+}
+
+/// Deposit fPOW stake
+async fn deposit(client: &AlgoClient, account: &Account) -> Result<()> {
+    let amount: u64 = std::env::var("AMOUNT")
+        .expect("Missing AMOUNT env var")
+        .parse()
+        .expect("Invalid AMOUNT");
+
+    let stake_box = stake_box_name(&account.address().0);
+    let treasury_box = treasury_box_name();
+
+    println!("Depositing {} fPOW...", amount);
+    let tx_id = submit_app_call(
+        client,
+        account,
+        FpowInstruction::Deposit,
+        vec![
+            amount.to_be_bytes().to_vec(),
+            0u64.to_be_bytes().to_vec(),
+        ],
+        vec![stake_box, treasury_box],
+    )
+    .await?;
+    println!("Deposit transaction: {}", tx_id);
+
+    Ok(())
+}
+
+/// Withdraw fPOW stake
+async fn withdraw(client: &AlgoClient, account: &Account) -> Result<()> {
+    let amount: u64 = std::env::var("AMOUNT")
+        .expect("Missing AMOUNT env var")
+        .parse()
+        .expect("Invalid AMOUNT");
+
+    let stake_box = stake_box_name(&account.address().0);
+    let treasury_box = treasury_box_name();
+
+    println!("Withdrawing {} fPOW...", amount);
+    let tx_id = submit_app_call(
+        client,
+        account,
+        FpowInstruction::Withdraw,
+        vec![amount.to_be_bytes().to_vec()],
+        vec![stake_box, treasury_box],
+    )
+    .await?;
+    println!("Withdraw transaction: {}", tx_id);
+
+    Ok(())
+}
+
+/// Claim staking yield
+async fn claim_yield(client: &AlgoClient, account: &Account) -> Result<()> {
+    let amount: u64 = std::env::var("AMOUNT")
+        .expect("Missing AMOUNT env var")
+        .parse()
+        .expect("Invalid AMOUNT");
+
+    let stake_box = stake_box_name(&account.address().0);
+    let treasury_box = treasury_box_name();
+
+    println!("Claiming {} fPOW yield...", amount);
+    let tx_id = submit_app_call(
+        client,
+        account,
+        FpowInstruction::ClaimYield,
+        vec![amount.to_be_bytes().to_vec()],
+        vec![stake_box, treasury_box],
+    )
+    .await?;
+    println!("Claim yield transaction: {}", tx_id);
+
+    Ok(())
 }

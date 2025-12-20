@@ -1,91 +1,89 @@
 use serde::{Deserialize, Serialize};
-use steel::*;
 
-use crate::state::{miner_pda, Treasury};
+use crate::state::{miner_box_name, Numeric, Treasury};
 
-use super::OreAccount;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable, Serialize, Deserialize)]
+/// Miner account state
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Miner {
-    /// The authority of this miner account.
-    pub authority: Pubkey,
+    /// The authority of this miner account (Algorand address bytes).
+    pub authority: [u8; 32],
 
     /// The miner's prospects in the current round.
     pub deployed: [u64; 25],
 
-    /// The cumulative amount of SOL deployed on each square prior to this miner's move.
+    /// The cumulative amount of ALGO deployed on each square prior to this miner's move.
     pub cumulative: [u64; 25],
 
-    /// SOL witheld in reserve to pay for checkpointing.
+    /// ALGO withheld in reserve to pay for checkpointing (in microalgos).
     pub checkpoint_fee: u64,
 
     /// The last round that this miner checkpointed.
     pub checkpoint_id: u64,
 
-    /// The last time this miner claimed ORE rewards.
-    pub last_claim_ore_at: i64,
+    /// The last time this miner claimed fPOW rewards (unix timestamp).
+    pub last_claim_fpow_at: i64,
 
-    /// The last time this miner claimed SOL rewards.
-    pub last_claim_sol_at: i64,
+    /// The last time this miner claimed ALGO rewards (unix timestamp).
+    pub last_claim_algo_at: i64,
 
     /// The rewards factor last time rewards were updated on this miner account.
     pub rewards_factor: Numeric,
 
-    /// The amount of SOL this miner can claim.
-    pub rewards_sol: u64,
+    /// The amount of ALGO this miner can claim (in microalgos).
+    pub rewards_algo: u64,
 
-    /// The amount of ORE this miner can claim.
-    pub rewards_ore: u64,
+    /// The amount of fPOW this miner can claim.
+    pub rewards_fpow: u64,
 
-    /// The amount of ORE this miner has earned from claim fees.
-    pub refined_ore: u64,
+    /// The amount of fPOW this miner has earned from claim fees.
+    pub refined_fpow: u64,
 
     /// The ID of the round this miner last played in.
     pub round_id: u64,
 
-    /// The total amount of SOL this miner has mined across all blocks.
-    pub lifetime_rewards_sol: u64,
+    /// The total amount of ALGO this miner has mined across all blocks.
+    pub lifetime_rewards_algo: u64,
 
-    /// The total amount of ORE this miner has mined across all blocks.
-    pub lifetime_rewards_ore: u64,
+    /// The total amount of fPOW this miner has mined across all blocks.
+    pub lifetime_rewards_fpow: u64,
 
-    /// The total amount of SOL this miner has deployed across all rounds.
+    /// The total amount of ALGO this miner has deployed across all rounds.
     pub lifetime_deployed: u64,
 }
 
 impl Miner {
-    pub fn pda(&self) -> (Pubkey, u8) {
-        miner_pda(self.authority)
+    pub fn box_name(&self) -> Vec<u8> {
+        miner_box_name(&self.authority)
     }
 
-    pub fn claim_ore(&mut self, clock: &Clock, treasury: &mut Treasury) -> u64 {
+    pub fn claim_fpow(&mut self, timestamp: i64, treasury: &mut Treasury) -> u64 {
         self.update_rewards(treasury);
-        let refined_ore = self.refined_ore;
-        let rewards_ore = self.rewards_ore;
-        let mut amount = refined_ore + rewards_ore;
-        self.refined_ore = 0;
-        self.rewards_ore = 0;
-        treasury.total_unclaimed -= rewards_ore;
-        treasury.total_refined -= refined_ore;
-        self.last_claim_ore_at = clock.unix_timestamp;
+        let refined_fpow = self.refined_fpow;
+        let rewards_fpow = self.rewards_fpow;
+        let mut amount = refined_fpow + rewards_fpow;
+        self.refined_fpow = 0;
+        self.rewards_fpow = 0;
+        treasury.total_unclaimed -= rewards_fpow;
+        treasury.total_refined -= refined_fpow;
+        self.last_claim_fpow_at = timestamp;
 
         // Charge a 10% fee and share with miners who haven't claimed yet.
         if treasury.total_unclaimed > 0 {
-            let fee = rewards_ore / 10;
+            let fee = rewards_fpow / 10;
             amount -= fee;
-            treasury.miner_rewards_factor += Numeric::from_fraction(fee, treasury.total_unclaimed);
+            treasury.miner_rewards_factor =
+                treasury.miner_rewards_factor + Numeric::from_fraction(fee, treasury.total_unclaimed);
             treasury.total_refined += fee;
-            self.lifetime_rewards_ore -= fee;
+            self.lifetime_rewards_fpow -= fee;
         }
 
         amount
     }
 
-    pub fn claim_sol(&mut self, clock: &Clock) -> u64 {
-        let amount = self.rewards_sol;
-        self.rewards_sol = 0;
-        self.last_claim_sol_at = clock.unix_timestamp;
+    pub fn claim_algo(&mut self, timestamp: i64) -> u64 {
+        let amount = self.rewards_algo;
+        self.rewards_algo = 0;
+        self.last_claim_algo_at = timestamp;
         amount
     }
 
@@ -96,9 +94,9 @@ impl Miner {
             if accumulated_rewards < Numeric::ZERO {
                 panic!("Accumulated rewards is negative");
             }
-            let personal_rewards = accumulated_rewards * Numeric::from_u64(self.rewards_ore);
-            self.refined_ore += personal_rewards.to_u64();
-            self.lifetime_rewards_ore += personal_rewards.to_u64();
+            let personal_rewards = accumulated_rewards * Numeric::from_u64(self.rewards_fpow);
+            self.refined_fpow += personal_rewards.to_u64();
+            self.lifetime_rewards_fpow += personal_rewards.to_u64();
         }
 
         // Update this miner account's last seen rewards factor.
@@ -106,4 +104,24 @@ impl Miner {
     }
 }
 
-account!(OreAccount, Miner);
+impl Default for Miner {
+    fn default() -> Self {
+        Self {
+            authority: [0u8; 32],
+            deployed: [0u64; 25],
+            cumulative: [0u64; 25],
+            checkpoint_fee: 0,
+            checkpoint_id: 0,
+            last_claim_fpow_at: 0,
+            last_claim_algo_at: 0,
+            rewards_factor: Numeric::ZERO,
+            rewards_algo: 0,
+            rewards_fpow: 0,
+            refined_fpow: 0,
+            round_id: 0,
+            lifetime_rewards_algo: 0,
+            lifetime_rewards_fpow: 0,
+            lifetime_deployed: 0,
+        }
+    }
+}

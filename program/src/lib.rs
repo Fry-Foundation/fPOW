@@ -1,91 +1,94 @@
-mod automate;
-mod bury;
-mod buyback;
-mod checkpoint;
-mod claim_ore;
-mod claim_sol;
-mod claim_yield;
-mod close;
-mod compound_yield;
-mod deploy;
-mod deposit;
-mod liq;
-mod log;
-mod new_var;
-mod reload_sol;
-mod reset;
-mod set_admin;
-mod withdraw;
-mod wrap;
+//! fPOW Program Utilities
+//!
+//! This crate provides Rust utilities for interacting with the fPOW smart contract
+//! on Algorand. The actual smart contract is written in PyTeal and can be found
+//! in the `contract/` directory.
+//!
+//! ## Smart Contract
+//!
+//! The fPOW smart contract is implemented in PyTeal at `program/contract/fpow.py`.
+//! To compile the contract to TEAL:
+//!
+//! ```bash
+//! cd program/contract
+//! pip install -r requirements.txt
+//! python fpow.py
+//! ```
+//!
+//! This will generate `approval.teal` and `clear.teal` files.
 
-use automate::*;
-use bury::*;
-use buyback::*;
-use checkpoint::*;
-use claim_ore::*;
-use claim_sol::*;
-use claim_yield::*;
-use close::*;
-use compound_yield::*;
-use deploy::*;
-use deposit::*;
-use liq::*;
-use log::*;
-use new_var::*;
-use reload_sol::*;
-use reset::*;
-use set_admin::*;
-use withdraw::*;
-use wrap::*;
+pub use fpow_api::prelude::*;
 
-use ore_api::instruction::*;
-use solana_security_txt::security_txt;
-use steel::*;
+/// Utility functions for working with the fPOW contract
+pub mod utils {
+    use sha2::{Sha512_256, Digest};
 
-pub fn process_instruction(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    data: &[u8],
-) -> ProgramResult {
-    let (ix, data) = parse_instruction(&ore_api::ID, program_id, data)?;
-
-    match ix {
-        // Miner
-        OreInstruction::Automate => process_automate(accounts, data)?,
-        OreInstruction::Checkpoint => process_checkpoint(accounts, data)?,
-        OreInstruction::ClaimSOL => process_claim_sol(accounts, data)?,
-        OreInstruction::ClaimORE => process_claim_ore(accounts, data)?,
-        OreInstruction::Deploy => process_deploy(accounts, data)?,
-        OreInstruction::Log => process_log(accounts, data)?,
-        OreInstruction::Close => process_close(accounts, data)?,
-        OreInstruction::Reset => process_reset(accounts, data)?,
-        OreInstruction::ReloadSOL => process_reload_sol(accounts, data)?,
-
-        // Staker
-        OreInstruction::Deposit => process_deposit(accounts, data)?,
-        OreInstruction::Withdraw => process_withdraw(accounts, data)?,
-        OreInstruction::ClaimYield => process_claim_yield(accounts, data)?,
-        OreInstruction::CompoundYield => process_compound_yield(accounts, data)?,
-
-        // Admin
-        OreInstruction::Buyback => process_buyback(accounts, data)?,
-        OreInstruction::Bury => process_bury(accounts, data)?,
-        OreInstruction::Wrap => process_wrap(accounts, data)?,
-        OreInstruction::SetAdmin => process_set_admin(accounts, data)?,
-        OreInstruction::NewVar => process_new_var(accounts, data)?,
-        OreInstruction::Liq => process_liq(accounts, data)?,
+    /// Compute the method selector for an ABI method signature
+    pub fn method_selector(signature: &str) -> [u8; 4] {
+        let hash = Sha512_256::digest(signature.as_bytes());
+        let mut selector = [0u8; 4];
+        selector.copy_from_slice(&hash[0..4]);
+        selector
     }
 
-    Ok(())
+    /// Compute the address of an Algorand application
+    pub fn app_address(app_id: u64) -> [u8; 32] {
+        let mut data = b"appID".to_vec();
+        data.extend_from_slice(&app_id.to_be_bytes());
+        let hash = Sha512_256::digest(&data);
+        let mut address = [0u8; 32];
+        address.copy_from_slice(&hash);
+        address
+    }
+
+    /// Convert microalgos to ALGO (for display)
+    pub fn microalgos_to_algo(microalgos: u64) -> f64 {
+        microalgos as f64 / 1_000_000.0
+    }
+
+    /// Convert ALGO to microalgos
+    pub fn algo_to_microalgos(algo: f64) -> u64 {
+        (algo * 1_000_000.0) as u64
+    }
+
+    /// Convert fPOW base units to display units
+    pub fn fpow_to_display(amount: u64) -> f64 {
+        amount as f64 / 100_000_000_000.0 // 11 decimals
+    }
+
+    /// Convert display units to fPOW base units
+    pub fn display_to_fpow(amount: f64) -> u64 {
+        (amount * 100_000_000_000.0) as u64 // 11 decimals
+    }
 }
 
-entrypoint!(process_instruction);
+#[cfg(test)]
+mod tests {
+    use super::utils::*;
 
-security_txt! {
-    name: "ORE",
-    project_url: "https://ore.supply",
-    contacts: "email:hardhatchad@gmail.com,discord:hardhatchad",
-    policy: "https://github.com/regolith-labs/ore/blob/master/SECURITY.md",
-    preferred_languages: "en",
-    source_code: "https://github.com/regolith-labs/ore"
+    #[test]
+    fn test_method_selector() {
+        // Test known method selector
+        let selector = method_selector("claim_algo()void");
+        assert_eq!(selector.len(), 4);
+    }
+
+    #[test]
+    fn test_app_address() {
+        let address = app_address(12345);
+        assert_eq!(address.len(), 32);
+    }
+
+    #[test]
+    fn test_microalgos_conversion() {
+        assert_eq!(microalgos_to_algo(1_000_000), 1.0);
+        assert_eq!(algo_to_microalgos(1.0), 1_000_000);
+    }
+
+    #[test]
+    fn test_fpow_conversion() {
+        let one_fpow = 100_000_000_000u64; // 11 decimals
+        assert_eq!(fpow_to_display(one_fpow), 1.0);
+        assert_eq!(display_to_fpow(1.0), one_fpow);
+    }
 }
